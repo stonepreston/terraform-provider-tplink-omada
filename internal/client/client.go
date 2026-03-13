@@ -1,0 +1,1345 @@
+package client
+
+import (
+	"bytes"
+	"context"
+	"crypto/tls"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/cookiejar"
+	"strings"
+	"sync"
+	"time"
+)
+
+// Client is the Omada Controller API client.
+type Client struct {
+	baseURL    string
+	username   string
+	password   string
+	omadacID   string
+	siteID     string
+	siteName   string
+	token      string
+	httpClient *http.Client
+	mu         sync.Mutex
+	readOnly   bool
+}
+
+// ErrReadOnly is returned when a write operation is attempted in read-only mode.
+var ErrReadOnly = fmt.Errorf("operation blocked: provider is in read_only mode — only data sources and imports are allowed")
+
+// APIResponse is the standard response envelope from the Omada API.
+type APIResponse struct {
+	ErrorCode int             `json:"errorCode"`
+	Msg       string          `json:"msg"`
+	Result    json.RawMessage `json:"result"`
+}
+
+// PaginatedResult wraps paginated list responses.
+type PaginatedResult struct {
+	TotalRows   int             `json:"totalRows"`
+	CurrentPage int             `json:"currentPage"`
+	CurrentSize int             `json:"currentSize"`
+	Data        json.RawMessage `json:"data"`
+}
+
+// ControllerInfo holds the controller metadata returned by /api/info.
+type ControllerInfo struct {
+	OmadacID      string `json:"omadacId"`
+	ControllerVer string `json:"controllerVer"`
+	APIVer        string `json:"apiVer"`
+	Type          int    `json:"type"`
+}
+
+// LoginResult holds the login response.
+type LoginResult struct {
+	Token string `json:"token"`
+}
+
+// Site represents an Omada site (full details from GET /api/v2/sites/{id}).
+type Site struct {
+	ID       string `json:"id"`
+	Key      string `json:"key,omitempty"`
+	Name     string `json:"name"`
+	Type     int    `json:"type,omitempty"`
+	Region   string `json:"region,omitempty"`
+	TimeZone string `json:"timeZone,omitempty"`
+	Scenario string `json:"scenario,omitempty"`
+}
+
+// SiteCreateRequest is the payload for POST /api/v2/sites.
+type SiteCreateRequest struct {
+	Name                 string              `json:"name"`
+	Region               string              `json:"region"`
+	TimeZone             string              `json:"timeZone"`
+	Scenario             string              `json:"scenario"`
+	Type                 int                 `json:"type"`
+	DeviceAccountSetting *DeviceAccountInput `json:"deviceAccountSetting,omitempty"`
+}
+
+// DeviceAccountInput is the device account payload for site creation.
+type DeviceAccountInput struct {
+	Username string `json:"username"`
+	Password string `json:"password"`
+}
+
+// SiteCreateResult is the response from POST /api/v2/sites.
+type SiteCreateResult struct {
+	SiteID string `json:"siteId"`
+}
+
+// SiteSettingUpdate is the payload for PATCH /sites/{id}/setting to update site-level fields.
+type SiteSettingUpdate struct {
+	Site *SiteSettingFields `json:"site"`
+}
+
+// SiteSettingFields holds the updatable site fields sent inside the "site" key.
+type SiteSettingFields struct {
+	Name     string `json:"name,omitempty"`
+	Region   string `json:"region,omitempty"`
+	TimeZone string `json:"timeZone,omitempty"`
+	Scenario string `json:"scenario,omitempty"`
+}
+
+// DHCPSettings holds DHCP server configuration for a network.
+type DHCPSettings struct {
+	Enable      bool   `json:"enable"`
+	IPAddrStart string `json:"ipaddrStart,omitempty"`
+	IPAddrEnd   string `json:"ipaddrEnd,omitempty"`
+	LeaseTime   int    `json:"leasetime,omitempty"`
+}
+
+// Network represents a LAN network / VLAN configuration.
+type Network struct {
+	ID              string        `json:"id,omitempty"`
+	Name            string        `json:"name"`
+	Purpose         string        `json:"purpose,omitempty"`
+	Vlan            int           `json:"vlan"`
+	GatewaySubnet   string        `json:"gatewaySubnet,omitempty"`
+	DHCPSettings    *DHCPSettings `json:"dhcpSettings,omitempty"`
+	Isolation       bool          `json:"isolation,omitempty"`
+	IGMPSnoopEnable bool          `json:"igmpSnoopEnable,omitempty"`
+}
+
+// WlanGroup represents a wireless LAN group.
+type WlanGroup struct {
+	ID      string `json:"id"`
+	Name    string `json:"name"`
+	Clone   bool   `json:"clone"`
+	Primary bool   `json:"primary"`
+	Site    string `json:"site,omitempty"`
+}
+
+// WlanGroupCreateRequest is the payload for POST /setting/wlans.
+type WlanGroupCreateRequest struct {
+	Name  string `json:"name"`
+	Clone bool   `json:"clone"`
+}
+
+// WlanGroupCreateResult is the response from POST /setting/wlans.
+type WlanGroupCreateResult struct {
+	WlanID string `json:"wlanId"`
+}
+
+// WlanGroupUpdateRequest is the payload for PATCH /setting/wlans/{id}.
+type WlanGroupUpdateRequest struct {
+	Name string `json:"name"`
+}
+
+// WirelessNetwork represents an SSID/WLAN configuration.
+type WirelessNetwork struct {
+	ID             string       `json:"id,omitempty"`
+	Name           string       `json:"name"`
+	WlanID         string       `json:"wlanId,omitempty"`
+	Band           int          `json:"band"`
+	GuestNetEnable bool         `json:"guestNetEnable,omitempty"`
+	Security       int          `json:"security"`
+	Broadcast      bool         `json:"broadcast"`
+	PSKSetting     *PSKSetting  `json:"pskSetting,omitempty"`
+	VlanSetting    *VlanSetting `json:"vlanSetting,omitempty"`
+	Enable11r      bool         `json:"enable11r,omitempty"`
+	PmfMode        int          `json:"pmfMode,omitempty"`
+	RateLimit      *RateLimit   `json:"rateLimit,omitempty"`
+
+	// Additional fields needed for full create/update payload
+	RateAndBeaconCtrl json.RawMessage `json:"rateAndBeaconCtrl,omitempty"`
+	MultiCastSetting  json.RawMessage `json:"multiCastSetting,omitempty"`
+	SSIDRateLimit     json.RawMessage `json:"ssidRateLimit,omitempty"`
+	DHCPOption82      json.RawMessage `json:"dhcpOption82,omitempty"`
+
+	// Store raw JSON for PATCH operations (full object required)
+	RawJSON map[string]interface{} `json:"-"`
+}
+
+// PSKSetting holds WPA pre-shared key settings.
+type PSKSetting struct {
+	VersionPsk        int    `json:"versionPsk,omitempty"`
+	EncryptionPsk     int    `json:"encryptionPsk,omitempty"`
+	GikRekeyPskEnable bool   `json:"gikRekeyPskEnable,omitempty"`
+	SecurityKey       string `json:"securityKey"`
+}
+
+// VlanSetting holds VLAN configuration for an SSID.
+type VlanSetting struct {
+	Mode           int           `json:"mode"`
+	CustomConfig   *CustomConfig `json:"customConfig,omitempty"`
+	CurrentVlanId  int           `json:"currentVlanId,omitempty"`
+	CurrentVlanIds string        `json:"currentVlanIds,omitempty"`
+}
+
+// CustomConfig holds custom VLAN configuration for an SSID.
+type CustomConfig struct {
+	CustomMode        int              `json:"customMode,omitempty"`
+	LanNetworkID      string           `json:"lanNetworkId,omitempty"`
+	LanNetworkVlanIds map[string][]int `json:"lanNetworkVlanIds,omitempty"`
+	BridgeVlan        int              `json:"bridgeVlan,omitempty"`
+}
+
+// RateLimit holds rate limiting configuration.
+type RateLimit struct {
+	RateLimitID string `json:"rateLimitId,omitempty"`
+}
+
+// PortProfile represents a switch port profile.
+type PortProfile struct {
+	ID                   string   `json:"id,omitempty"`
+	Name                 string   `json:"name"`
+	NativeNetworkID      string   `json:"nativeNetworkId,omitempty"`
+	TagNetworkIDs        []string `json:"tagNetworkIds"`
+	UntagNetworkIDs      []string `json:"untagNetworkIds,omitempty"`
+	POE                  int      `json:"poe,omitempty"`
+	Dot1x                int      `json:"dot1x,omitempty"`
+	PortIsolationEnable  bool     `json:"portIsolationEnable,omitempty"`
+	LLDPMedEnable        bool     `json:"lldpMedEnable,omitempty"`
+	TopoNotifyEnable     bool     `json:"topoNotifyEnable,omitempty"`
+	SpanningTreeEnable   bool     `json:"spanningTreeEnable,omitempty"`
+	LoopbackDetectEnable bool     `json:"loopbackDetectEnable,omitempty"`
+	Type                 int      `json:"type,omitempty"`
+}
+
+// NewClient creates a new Omada API client.
+func NewClient(baseURL, username, password, site string, skipTLSVerify bool) (*Client, error) {
+	jar, err := cookiejar.New(nil)
+	if err != nil {
+		return nil, fmt.Errorf("creating cookie jar: %w", err)
+	}
+
+	transport := &http.Transport{
+		TLSClientConfig: &tls.Config{
+			InsecureSkipVerify: skipTLSVerify,
+		},
+	}
+
+	httpClient := &http.Client{
+		Jar:       jar,
+		Transport: transport,
+		Timeout:   30 * time.Second,
+	}
+
+	// Normalize base URL
+	baseURL = strings.TrimRight(baseURL, "/")
+
+	c := &Client{
+		baseURL:    baseURL,
+		username:   username,
+		password:   password,
+		siteName:   site,
+		httpClient: httpClient,
+	}
+
+	// Step 1: Get controller ID
+	if err := c.getControllerInfo(context.Background()); err != nil {
+		return nil, fmt.Errorf("getting controller info: %w", err)
+	}
+
+	// Step 2: Login
+	if err := c.login(context.Background()); err != nil {
+		return nil, fmt.Errorf("logging in: %w", err)
+	}
+
+	// Step 3: Resolve site ID (optional — deferred until a site-scoped call is made)
+	if site != "" {
+		if err := c.resolveSiteID(context.Background(), site); err != nil {
+			return nil, fmt.Errorf("resolving site: %w", err)
+		}
+	}
+
+	return c, nil
+}
+
+// getControllerInfo fetches the controller ID from /api/info.
+func (c *Client) getControllerInfo(ctx context.Context) error {
+	url := fmt.Sprintf("%s/api/info", c.baseURL)
+
+	resp, err := c.httpClient.Get(url)
+	if err != nil {
+		return fmt.Errorf("GET %s: %w", url, err)
+	}
+	defer resp.Body.Close()
+
+	var apiResp APIResponse
+	if err := json.NewDecoder(resp.Body).Decode(&apiResp); err != nil {
+		return fmt.Errorf("decoding response: %w", err)
+	}
+	if apiResp.ErrorCode != 0 {
+		return fmt.Errorf("API error %d: %s", apiResp.ErrorCode, apiResp.Msg)
+	}
+
+	var info ControllerInfo
+	if err := json.Unmarshal(apiResp.Result, &info); err != nil {
+		return fmt.Errorf("decoding controller info: %w", err)
+	}
+
+	c.omadacID = info.OmadacID
+	return nil
+}
+
+// login authenticates with the controller and stores the CSRF token.
+func (c *Client) login(ctx context.Context) error {
+	url := fmt.Sprintf("%s/%s/api/v2/login", c.baseURL, c.omadacID)
+
+	body := map[string]string{
+		"username": c.username,
+		"password": c.password,
+	}
+	jsonBody, _ := json.Marshal(body)
+
+	resp, err := c.httpClient.Post(url, "application/json", bytes.NewReader(jsonBody))
+	if err != nil {
+		return fmt.Errorf("POST %s: %w", url, err)
+	}
+	defer resp.Body.Close()
+
+	var apiResp APIResponse
+	if err := json.NewDecoder(resp.Body).Decode(&apiResp); err != nil {
+		return fmt.Errorf("decoding response: %w", err)
+	}
+	if apiResp.ErrorCode != 0 {
+		return fmt.Errorf("login failed (code %d): %s", apiResp.ErrorCode, apiResp.Msg)
+	}
+
+	var loginResult LoginResult
+	if err := json.Unmarshal(apiResp.Result, &loginResult); err != nil {
+		return fmt.Errorf("decoding login result: %w", err)
+	}
+
+	c.token = loginResult.Token
+	return nil
+}
+
+// resolveSiteID looks up the site ID by name.
+func (c *Client) resolveSiteID(ctx context.Context, siteName string) error {
+	sites, err := c.ListSites(ctx)
+	if err != nil {
+		return err
+	}
+	for _, s := range sites {
+		if strings.EqualFold(s.Name, siteName) || s.ID == siteName {
+			c.siteID = s.ID
+			return nil
+		}
+	}
+	return fmt.Errorf("site %q not found", siteName)
+}
+
+// ensureAuth re-authenticates if the session has expired.
+func (c *Client) ensureAuth(ctx context.Context) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.token == "" {
+		if err := c.login(ctx); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// reAuth forces re-authentication.
+func (c *Client) reAuth(ctx context.Context) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.token = ""
+	return c.login(ctx)
+}
+
+// ensureSiteID lazily resolves the site ID if not already set.
+func (c *Client) ensureSiteID(ctx context.Context) error {
+	if c.siteID != "" {
+		return nil
+	}
+	if c.siteName == "" {
+		return fmt.Errorf("site is required for this operation — set 'site' in the provider configuration")
+	}
+	return c.resolveSiteID(ctx, c.siteName)
+}
+
+// globalURL builds a URL for non-site-scoped endpoints.
+func (c *Client) globalURL(path string) string {
+	return fmt.Sprintf("%s/%s/api/v2%s?token=%s", c.baseURL, c.omadacID, path, c.token)
+}
+
+// siteURL builds a URL for site-scoped endpoints. Caller must ensure siteID is set.
+func (c *Client) siteURL(path string) string {
+	if c.siteID == "" {
+		// This should never happen if ensureSiteID is called properly
+		panic("siteURL called without siteID — call ensureSiteID first")
+	}
+	return fmt.Sprintf("%s/%s/api/v2/sites/%s%s?token=%s", c.baseURL, c.omadacID, c.siteID, path, c.token)
+}
+
+// doSiteRequest is a convenience wrapper that ensures siteID is resolved before making a site-scoped request.
+func (c *Client) doSiteRequest(ctx context.Context, method, path string, body interface{}) (*APIResponse, error) {
+	if err := c.ensureSiteID(ctx); err != nil {
+		return nil, err
+	}
+	url := c.siteURL(path)
+	return c.doRequest(ctx, method, url, body)
+}
+
+// doSiteRequestWithParams is like doSiteRequest but appends extra query params.
+func (c *Client) doSiteRequestWithParams(ctx context.Context, method, path, extraParams string, body interface{}) (*APIResponse, error) {
+	if err := c.ensureSiteID(ctx); err != nil {
+		return nil, err
+	}
+	url := c.siteURL(path) + extraParams
+	return c.doRequest(ctx, method, url, body)
+}
+
+// doRequest performs an HTTP request with authentication headers and retry on session expiry.
+func (c *Client) doRequest(ctx context.Context, method, url string, body interface{}) (*APIResponse, error) {
+	return c.doRequestWithRetry(ctx, method, url, body, true)
+}
+
+func (c *Client) doRequestWithRetry(ctx context.Context, method, url string, body interface{}, retry bool) (*APIResponse, error) {
+	var bodyReader io.Reader
+	if body != nil {
+		jsonBody, err := json.Marshal(body)
+		if err != nil {
+			return nil, fmt.Errorf("marshaling request body: %w", err)
+		}
+		bodyReader = bytes.NewReader(jsonBody)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, method, url, bodyReader)
+	if err != nil {
+		return nil, fmt.Errorf("creating request: %w", err)
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Csrf-Token", c.token)
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("%s %s: %w", method, url, err)
+	}
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("reading response body: %w", err)
+	}
+
+	var apiResp APIResponse
+	if err := json.Unmarshal(respBody, &apiResp); err != nil {
+		return nil, fmt.Errorf("decoding response (status %d, body: %s): %w", resp.StatusCode, string(respBody), err)
+	}
+
+	// Session expired — re-auth and retry once
+	if apiResp.ErrorCode == -1 && retry {
+		if err := c.reAuth(ctx); err != nil {
+			return nil, fmt.Errorf("re-authentication failed: %w", err)
+		}
+		// Rebuild URL with new token
+		url = strings.Replace(url, "&token="+c.token, "&token="+c.token, 1)
+		return c.doRequestWithRetry(ctx, method, url, body, false)
+	}
+
+	if apiResp.ErrorCode != 0 {
+		return &apiResp, fmt.Errorf("API error %d: %s", apiResp.ErrorCode, apiResp.Msg)
+	}
+
+	return &apiResp, nil
+}
+
+// decodePaginatedData decodes paginated list data from an API response.
+func decodePaginatedData(result json.RawMessage, target interface{}) error {
+	var paginated PaginatedResult
+	if err := json.Unmarshal(result, &paginated); err != nil {
+		// Try direct array decode (some endpoints don't paginate)
+		return json.Unmarshal(result, target)
+	}
+	if paginated.Data == nil {
+		return json.Unmarshal(result, target)
+	}
+	return json.Unmarshal(paginated.Data, target)
+}
+
+// GetSiteID returns the resolved site ID.
+func (c *Client) GetSiteID() string {
+	return c.siteID
+}
+
+// GetOmadacID returns the controller ID.
+func (c *Client) GetOmadacID() string {
+	return c.omadacID
+}
+
+// --- Sites ---
+
+// ListSites returns all sites from the controller.
+func (c *Client) ListSites(ctx context.Context) ([]Site, error) {
+	url := c.globalURL("/sites") + "&currentPage=1&currentPageSize=100"
+	resp, err := c.doRequest(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	var sites []Site
+	if err := decodePaginatedData(resp.Result, &sites); err != nil {
+		return nil, fmt.Errorf("decoding sites: %w", err)
+	}
+	return sites, nil
+}
+
+// GetSite returns a single site by ID via GET /api/v2/sites/{siteId}.
+func (c *Client) GetSite(ctx context.Context, siteID string) (*Site, error) {
+	url := c.globalURL(fmt.Sprintf("/sites/%s", siteID))
+	resp, err := c.doRequest(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	var site Site
+	if err := json.Unmarshal(resp.Result, &site); err != nil {
+		return nil, fmt.Errorf("decoding site: %w", err)
+	}
+	return &site, nil
+}
+
+// CreateSite creates a new site via POST /api/v2/sites.
+func (c *Client) CreateSite(ctx context.Context, req *SiteCreateRequest) (string, error) {
+	url := c.globalURL("/sites")
+	resp, err := c.doRequest(ctx, http.MethodPost, url, req)
+	if err != nil {
+		return "", err
+	}
+	var result SiteCreateResult
+	if err := json.Unmarshal(resp.Result, &result); err != nil {
+		return "", fmt.Errorf("decoding create site result: %w", err)
+	}
+	return result.SiteID, nil
+}
+
+// UpdateSite updates a site's name, region, timezone, and scenario via PATCH /sites/{id}/setting.
+func (c *Client) UpdateSite(ctx context.Context, siteID string, fields *SiteSettingFields) error {
+	url := fmt.Sprintf("%s/%s/api/v2/sites/%s/setting?token=%s", c.baseURL, c.omadacID, siteID, c.token)
+	payload := &SiteSettingUpdate{Site: fields}
+	_, err := c.doRequest(ctx, http.MethodPatch, url, payload)
+	return err
+}
+
+// DeleteSite deletes a site via DELETE /api/v2/sites/{siteId}.
+func (c *Client) DeleteSite(ctx context.Context, siteID string) error {
+	url := c.globalURL(fmt.Sprintf("/sites/%s", siteID))
+	_, err := c.doRequest(ctx, http.MethodDelete, url, nil)
+	return err
+}
+
+// --- Networks ---
+
+// ListNetworks returns all LAN networks for the current site.
+func (c *Client) ListNetworks(ctx context.Context) ([]Network, error) {
+	resp, err := c.doSiteRequestWithParams(ctx, http.MethodGet, "/setting/lan/networks", "&currentPage=1&currentPageSize=100", nil)
+	if err != nil {
+		return nil, err
+	}
+	var networks []Network
+	if err := decodePaginatedData(resp.Result, &networks); err != nil {
+		return nil, fmt.Errorf("decoding networks: %w", err)
+	}
+	return networks, nil
+}
+
+// GetNetwork returns a network by ID.
+func (c *Client) GetNetwork(ctx context.Context, networkID string) (*Network, error) {
+	networks, err := c.ListNetworks(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for _, n := range networks {
+		if n.ID == networkID {
+			return &n, nil
+		}
+	}
+	return nil, fmt.Errorf("network %q not found", networkID)
+}
+
+// CreateNetwork creates a new LAN network.
+func (c *Client) CreateNetwork(ctx context.Context, network *Network) (*Network, error) {
+	resp, err := c.doSiteRequest(ctx, http.MethodPost, "/setting/lan/networks", network)
+	if err != nil {
+		return nil, err
+	}
+	var created Network
+	if err := json.Unmarshal(resp.Result, &created); err != nil {
+		return nil, fmt.Errorf("decoding created network: %w", err)
+	}
+	return &created, nil
+}
+
+// UpdateNetwork updates an existing LAN network.
+func (c *Client) UpdateNetwork(ctx context.Context, networkID string, network *Network) (*Network, error) {
+	resp, err := c.doSiteRequest(ctx, http.MethodPatch, fmt.Sprintf("/setting/lan/networks/%s", networkID), network)
+	if err != nil {
+		return nil, err
+	}
+	var updated Network
+	if err := json.Unmarshal(resp.Result, &updated); err != nil {
+		return nil, fmt.Errorf("decoding updated network: %w", err)
+	}
+	return &updated, nil
+}
+
+// DeleteNetwork deletes a LAN network.
+func (c *Client) DeleteNetwork(ctx context.Context, networkID string) error {
+	_, err := c.doSiteRequest(ctx, http.MethodDelete, fmt.Sprintf("/setting/lan/networks/%s", networkID), nil)
+	return err
+}
+
+// --- Wireless Networks (SSIDs) ---
+
+// ListWlanGroups returns all WLAN groups.
+func (c *Client) ListWlanGroups(ctx context.Context) ([]WlanGroup, error) {
+	resp, err := c.doSiteRequestWithParams(ctx, http.MethodGet, "/setting/wlans", "&currentPage=1&currentPageSize=100", nil)
+	if err != nil {
+		return nil, err
+	}
+	var groups []WlanGroup
+	if err := decodePaginatedData(resp.Result, &groups); err != nil {
+		return nil, fmt.Errorf("decoding wlan groups: %w", err)
+	}
+	return groups, nil
+}
+
+// GetDefaultWlanGroupID returns the first WLAN group's ID (usually "Default").
+func (c *Client) GetDefaultWlanGroupID(ctx context.Context) (string, error) {
+	groups, err := c.ListWlanGroups(ctx)
+	if err != nil {
+		return "", err
+	}
+	if len(groups) == 0 {
+		return "", fmt.Errorf("no WLAN groups found")
+	}
+	return groups[0].ID, nil
+}
+
+// GetWlanGroup returns a WLAN group by ID (fetches from list since individual GET is not supported).
+func (c *Client) GetWlanGroup(ctx context.Context, wlanGroupID string) (*WlanGroup, error) {
+	groups, err := c.ListWlanGroups(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for _, g := range groups {
+		if g.ID == wlanGroupID {
+			return &g, nil
+		}
+	}
+	return nil, fmt.Errorf("WLAN group %q not found", wlanGroupID)
+}
+
+// CreateWlanGroup creates a new WLAN group.
+func (c *Client) CreateWlanGroup(ctx context.Context, name string, clone bool) (string, error) {
+	req := &WlanGroupCreateRequest{
+		Name:  name,
+		Clone: clone,
+	}
+	resp, err := c.doSiteRequest(ctx, http.MethodPost, "/setting/wlans", req)
+	if err != nil {
+		return "", err
+	}
+	var result WlanGroupCreateResult
+	if err := json.Unmarshal(resp.Result, &result); err != nil {
+		return "", fmt.Errorf("decoding create wlan group result: %w", err)
+	}
+	return result.WlanID, nil
+}
+
+// UpdateWlanGroup renames a WLAN group.
+func (c *Client) UpdateWlanGroup(ctx context.Context, wlanGroupID, name string) error {
+	req := &WlanGroupUpdateRequest{Name: name}
+	_, err := c.doSiteRequest(ctx, http.MethodPatch, fmt.Sprintf("/setting/wlans/%s", wlanGroupID), req)
+	return err
+}
+
+// DeleteWlanGroup deletes a WLAN group.
+func (c *Client) DeleteWlanGroup(ctx context.Context, wlanGroupID string) error {
+	_, err := c.doSiteRequest(ctx, http.MethodDelete, fmt.Sprintf("/setting/wlans/%s", wlanGroupID), nil)
+	return err
+}
+
+// ListWirelessNetworks returns all SSIDs in a WLAN group.
+func (c *Client) ListWirelessNetworks(ctx context.Context, wlanGroupID string) ([]WirelessNetwork, error) {
+	resp, err := c.doSiteRequestWithParams(ctx, http.MethodGet, fmt.Sprintf("/setting/wlans/%s/ssids", wlanGroupID), "&currentPage=1&currentPageSize=100", nil)
+	if err != nil {
+		return nil, err
+	}
+	var ssids []WirelessNetwork
+	if err := decodePaginatedData(resp.Result, &ssids); err != nil {
+		return nil, fmt.Errorf("decoding SSIDs: %w", err)
+	}
+	return ssids, nil
+}
+
+// GetWirelessNetwork returns a specific SSID.
+func (c *Client) GetWirelessNetwork(ctx context.Context, wlanGroupID, ssidID string) (*WirelessNetwork, error) {
+	ssids, err := c.ListWirelessNetworks(ctx, wlanGroupID)
+	if err != nil {
+		return nil, err
+	}
+	for _, s := range ssids {
+		if s.ID == ssidID {
+			return &s, nil
+		}
+	}
+	return nil, fmt.Errorf("SSID %q not found in WLAN group %q", ssidID, wlanGroupID)
+}
+
+// GetWirelessNetworkRaw returns the raw JSON for a specific SSID (needed for PATCH).
+func (c *Client) GetWirelessNetworkRaw(ctx context.Context, wlanGroupID, ssidID string) (map[string]interface{}, error) {
+	resp, err := c.doSiteRequestWithParams(ctx, http.MethodGet, fmt.Sprintf("/setting/wlans/%s/ssids", wlanGroupID), "&currentPage=1&currentPageSize=100", nil)
+	if err != nil {
+		return nil, err
+	}
+
+	var paginated PaginatedResult
+	if err := json.Unmarshal(resp.Result, &paginated); err != nil {
+		return nil, err
+	}
+
+	var ssids []map[string]interface{}
+	if err := json.Unmarshal(paginated.Data, &ssids); err != nil {
+		return nil, err
+	}
+
+	for _, s := range ssids {
+		if id, ok := s["id"].(string); ok && id == ssidID {
+			return s, nil
+		}
+	}
+	return nil, fmt.Errorf("SSID %q not found", ssidID)
+}
+
+// CreateWirelessNetwork creates a new SSID.
+func (c *Client) CreateWirelessNetwork(ctx context.Context, wlanGroupID string, ssid *WirelessNetwork) (*WirelessNetwork, error) {
+	resp, err := c.doSiteRequest(ctx, http.MethodPost, fmt.Sprintf("/setting/wlans/%s/ssids", wlanGroupID), ssid)
+	if err != nil {
+		return nil, err
+	}
+	var created WirelessNetwork
+	if err := json.Unmarshal(resp.Result, &created); err != nil {
+		return nil, fmt.Errorf("decoding created SSID: %w", err)
+	}
+	return &created, nil
+}
+
+// UpdateWirelessNetwork updates an existing SSID (requires full object).
+func (c *Client) UpdateWirelessNetwork(ctx context.Context, wlanGroupID, ssidID string, ssid map[string]interface{}) (*WirelessNetwork, error) {
+	// Remove read-only fields that must not be in PATCH
+	readOnlyFields := []string{"id", "idInt", "index", "site", "resource", "vlanEnable", "portalEnable", "accessEnable"}
+	for _, f := range readOnlyFields {
+		delete(ssid, f)
+	}
+
+	resp, err := c.doSiteRequest(ctx, http.MethodPatch, fmt.Sprintf("/setting/wlans/%s/ssids/%s", wlanGroupID, ssidID), ssid)
+	if err != nil {
+		return nil, err
+	}
+	var updated WirelessNetwork
+	if err := json.Unmarshal(resp.Result, &updated); err != nil {
+		return nil, fmt.Errorf("decoding updated SSID: %w", err)
+	}
+	return &updated, nil
+}
+
+// DeleteWirelessNetwork deletes an SSID.
+func (c *Client) DeleteWirelessNetwork(ctx context.Context, wlanGroupID, ssidID string) error {
+	_, err := c.doSiteRequest(ctx, http.MethodDelete, fmt.Sprintf("/setting/wlans/%s/ssids/%s", wlanGroupID, ssidID), nil)
+	return err
+}
+
+// --- Port Profiles ---
+
+// ListPortProfiles returns all LAN port profiles.
+func (c *Client) ListPortProfiles(ctx context.Context) ([]PortProfile, error) {
+	resp, err := c.doSiteRequestWithParams(ctx, http.MethodGet, "/setting/lan/profiles", "&currentPage=1&currentPageSize=100", nil)
+	if err != nil {
+		return nil, err
+	}
+	var profiles []PortProfile
+	if err := decodePaginatedData(resp.Result, &profiles); err != nil {
+		return nil, fmt.Errorf("decoding port profiles: %w", err)
+	}
+	return profiles, nil
+}
+
+// GetPortProfile returns a port profile by ID.
+func (c *Client) GetPortProfile(ctx context.Context, profileID string) (*PortProfile, error) {
+	profiles, err := c.ListPortProfiles(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for _, p := range profiles {
+		if p.ID == profileID {
+			return &p, nil
+		}
+	}
+	return nil, fmt.Errorf("port profile %q not found", profileID)
+}
+
+// CreatePortProfile creates a new port profile.
+func (c *Client) CreatePortProfile(ctx context.Context, profile *PortProfile) (*PortProfile, error) {
+	resp, err := c.doSiteRequest(ctx, http.MethodPost, "/setting/lan/profiles", profile)
+	if err != nil {
+		return nil, err
+	}
+	var created PortProfile
+	if err := json.Unmarshal(resp.Result, &created); err != nil {
+		return nil, fmt.Errorf("decoding created port profile: %w", err)
+	}
+	return &created, nil
+}
+
+// UpdatePortProfile updates a port profile.
+func (c *Client) UpdatePortProfile(ctx context.Context, profileID string, profile *PortProfile) (*PortProfile, error) {
+	resp, err := c.doSiteRequest(ctx, http.MethodPatch, fmt.Sprintf("/setting/lan/profiles/%s", profileID), profile)
+	if err != nil {
+		return nil, err
+	}
+	var updated PortProfile
+	if err := json.Unmarshal(resp.Result, &updated); err != nil {
+		return nil, fmt.Errorf("decoding updated port profile: %w", err)
+	}
+	return &updated, nil
+}
+
+// DeletePortProfile deletes a port profile.
+func (c *Client) DeletePortProfile(ctx context.Context, profileID string) error {
+	_, err := c.doSiteRequest(ctx, http.MethodDelete, fmt.Sprintf("/setting/lan/profiles/%s", profileID), nil)
+	return err
+}
+
+// --- Site Settings ---
+
+// SiteSettings represents the full site settings object from GET /setting.
+type SiteSettings struct {
+	Site                     *SiteSettingsSite         `json:"site,omitempty"`
+	AutoUpgrade              *AutoUpgrade              `json:"autoUpgrade,omitempty"`
+	Mesh                     *MeshSettings             `json:"mesh,omitempty"`
+	SpeedTest                *SpeedTest                `json:"speedTest,omitempty"`
+	Alert                    *AlertSettings            `json:"alert,omitempty"`
+	RemoteLog                *RemoteLog                `json:"remoteLog,omitempty"`
+	AdvancedFeature          *AdvancedFeature          `json:"advancedFeature,omitempty"`
+	LLDP                     *LLDPSettings             `json:"lldp,omitempty"`
+	BeaconControl            *BeaconControl            `json:"beaconControl,omitempty"`
+	BandSteering             *BandSteering             `json:"bandSteering,omitempty"`
+	BandSteeringForMultiBand *BandSteeringForMultiBand `json:"bandSteeringForMultiBand,omitempty"`
+	AirtimeFairness          *AirtimeFairness          `json:"airtimeFairness,omitempty"`
+	LED                      *LEDSettings              `json:"led,omitempty"`
+	DeviceAccount            *DeviceAccount            `json:"deviceAccount,omitempty"`
+	Roaming                  *RoamingSettings          `json:"roaming,omitempty"`
+	RememberDevice           *RememberDevice           `json:"rememberDevice,omitempty"`
+}
+
+// SiteSettingsSite holds the core site identity fields within settings.
+type SiteSettingsSite struct {
+	Key      string `json:"key,omitempty"`
+	Name     string `json:"name,omitempty"`
+	Region   string `json:"region,omitempty"`
+	TimeZone string `json:"timeZone,omitempty"`
+	Scenario string `json:"scenario,omitempty"`
+}
+
+// AutoUpgrade controls automatic firmware upgrade.
+type AutoUpgrade struct {
+	Enable bool `json:"enable"`
+}
+
+// MeshSettings controls mesh networking.
+type MeshSettings struct {
+	MeshEnable         bool `json:"meshEnable"`
+	AutoFailoverEnable bool `json:"autoFailoverEnable"`
+	DefGatewayEnable   bool `json:"defGatewayEnable"`
+	FullSector         bool `json:"fullSector"`
+}
+
+// SpeedTest controls the speed test schedule.
+type SpeedTest struct {
+	Enable   bool `json:"enable"`
+	Interval int  `json:"interval,omitempty"`
+}
+
+// AlertSettings controls alert notifications.
+type AlertSettings struct {
+	Enable      bool `json:"enable"`
+	DelayEnable bool `json:"delayEnable"`
+	Delay       int  `json:"delay,omitempty"`
+}
+
+// RemoteLog controls syslog remote logging.
+type RemoteLog struct {
+	Enable        bool   `json:"enable"`
+	Server        string `json:"server,omitempty"`
+	Port          int    `json:"port,omitempty"`
+	MoreClientLog bool   `json:"moreClientLog"`
+}
+
+// AdvancedFeature controls the advanced features toggle.
+type AdvancedFeature struct {
+	Enable bool `json:"enable"`
+}
+
+// LLDPSettings controls the LLDP protocol toggle.
+type LLDPSettings struct {
+	Enable bool `json:"enable"`
+}
+
+// BeaconControl holds Wi-Fi beacon and DTIM settings per band.
+type BeaconControl struct {
+	BeaconIntvMode2g         int `json:"beaconIntvMode2g"`
+	DtimPeriod2g             int `json:"dtimPeriod2g"`
+	RtsThreshold2g           int `json:"rtsThreshold2g"`
+	FragmentationThreshold2g int `json:"fragmentationThreshold2g"`
+	BeaconIntvMode5g         int `json:"beaconIntvMode5g"`
+	DtimPeriod5g             int `json:"dtimPeriod5g"`
+	RtsThreshold5g           int `json:"rtsThreshold5g"`
+	FragmentationThreshold5g int `json:"fragmentationThreshold5g"`
+	BeaconInterval6g         int `json:"beaconInterval6g"`
+	BeaconIntvMode6g         int `json:"beaconIntvMode6g"`
+	DtimPeriod6g             int `json:"dtimPeriod6g"`
+	RtsThreshold6g           int `json:"rtsThreshold6g"`
+	FragmentationThreshold6g int `json:"fragmentationThreshold6g"`
+}
+
+// BandSteering controls band steering parameters.
+type BandSteering struct {
+	Enable              bool `json:"enable"`
+	ConnectionThreshold int  `json:"connectionThreshold,omitempty"`
+	DifferenceThreshold int  `json:"differenceThreshold,omitempty"`
+	MaxFailures         int  `json:"maxFailures,omitempty"`
+}
+
+// BandSteeringForMultiBand controls multi-band steering mode.
+type BandSteeringForMultiBand struct {
+	Mode int `json:"mode"`
+}
+
+// AirtimeFairness controls airtime fairness per band.
+type AirtimeFairness struct {
+	Enable2g bool `json:"enable2g"`
+	Enable5g bool `json:"enable5g"`
+	Enable6g bool `json:"enable6g"`
+}
+
+// LEDSettings controls AP LED on/off.
+type LEDSettings struct {
+	Enable bool `json:"enable"`
+}
+
+// DeviceAccount holds device SSH/management credentials.
+type DeviceAccount struct {
+	Username string `json:"username,omitempty"`
+	Password string `json:"password,omitempty"`
+}
+
+// RoamingSettings controls fast and AI roaming.
+type RoamingSettings struct {
+	FastRoamingEnable         bool `json:"fastRoamingEnable"`
+	AiRoamingEnable           bool `json:"aiRoamingEnable"`
+	DualBand11kReportEnable   bool `json:"dualBand11kReportEnable"`
+	ForceDisassociationEnable bool `json:"forceDisassociationEnable"`
+	NonStickRoamingEnable     bool `json:"nonStickRoamingEnable"`
+	NonPingPongRoamingEnable  bool `json:"nonPingPongRoamingEnable"`
+}
+
+// RememberDevice controls the remember device toggle.
+type RememberDevice struct {
+	Enable bool `json:"enable"`
+}
+
+// GetSiteSettings returns the full site settings for the current site.
+func (c *Client) GetSiteSettings(ctx context.Context) (*SiteSettings, error) {
+	resp, err := c.doSiteRequest(ctx, http.MethodGet, "/setting", nil)
+	if err != nil {
+		return nil, err
+	}
+	var settings SiteSettings
+	if err := json.Unmarshal(resp.Result, &settings); err != nil {
+		return nil, fmt.Errorf("decoding site settings: %w", err)
+	}
+	return &settings, nil
+}
+
+// UpdateSiteSettings patches site settings with the provided partial object.
+func (c *Client) UpdateSiteSettings(ctx context.Context, settings *SiteSettings) (*SiteSettings, error) {
+	resp, err := c.doSiteRequest(ctx, http.MethodPatch, "/setting", settings)
+	if err != nil {
+		return nil, err
+	}
+	var updated SiteSettings
+	if err := json.Unmarshal(resp.Result, &updated); err != nil {
+		return nil, fmt.Errorf("decoding updated site settings: %w", err)
+	}
+	return &updated, nil
+}
+
+// --- Devices ---
+
+// Device represents a device in the Omada controller (AP, switch, gateway).
+type Device struct {
+	Type            string  `json:"type"`
+	MAC             string  `json:"mac"`
+	Name            string  `json:"name"`
+	Model           string  `json:"model"`
+	ModelVersion    string  `json:"modelVersion,omitempty"`
+	FirmwareVersion string  `json:"firmwareVersion,omitempty"`
+	Version         string  `json:"version,omitempty"`
+	IP              string  `json:"ip"`
+	Status          int     `json:"status"`
+	StatusCategory  int     `json:"statusCategory,omitempty"`
+	Uptime          string  `json:"uptime,omitempty"`
+	UptimeLong      int64   `json:"uptimeLong,omitempty"`
+	CPUUtil         float64 `json:"cpuUtil,omitempty"`
+	MemUtil         float64 `json:"memUtil,omitempty"`
+	ClientNum       int     `json:"clientNum,omitempty"`
+}
+
+// APRadioSetting represents radio configuration for 2.4GHz or 5GHz.
+type APRadioSetting struct {
+	RadioEnable  bool   `json:"radioEnable"`
+	ChannelWidth string `json:"channelWidth"`
+	Channel      string `json:"channel"`
+	TxPower      int    `json:"txPower"`
+	TxPowerLevel int    `json:"txPowerLevel"`
+	Freq         int    `json:"freq,omitempty"`
+	WirelessMode int    `json:"wirelessMode,omitempty"`
+}
+
+// APIPSetting holds IP configuration for the AP.
+type APIPSetting struct {
+	Mode         string `json:"mode"`
+	Fallback     bool   `json:"fallback,omitempty"`
+	FallbackIP   string `json:"fallbackIp,omitempty"`
+	FallbackMask string `json:"fallbackMask,omitempty"`
+	UseFixedAddr bool   `json:"useFixedAddr,omitempty"`
+}
+
+// APMVlanSetting holds management VLAN settings.
+type APMVlanSetting struct {
+	Mode         int    `json:"mode"`
+	LanNetworkID string `json:"lanNetworkId,omitempty"`
+}
+
+// APLBSetting holds load balancing settings per band.
+type APLBSetting struct {
+	LBEnable   bool `json:"lbEnable"`
+	MaxClients int  `json:"maxClients,omitempty"`
+}
+
+// APRSSISetting holds RSSI threshold settings per band.
+type APRSSISetting struct {
+	RSSIEnable bool `json:"rssiEnable"`
+	Threshold  int  `json:"threshold,omitempty"`
+}
+
+// APQoSSetting holds QoS/WMM settings per band.
+type APQoSSetting struct {
+	WmmEnable         bool `json:"wmmEnable"`
+	NoAcknowledgement bool `json:"noAcknowledgement"`
+	DeliveryEnable    bool `json:"deliveryEnable"`
+}
+
+// APL3AccessSetting holds L3 management access settings.
+type APL3AccessSetting struct {
+	Enable bool `json:"enable"`
+}
+
+// APSSIDOverride represents a per-SSID override on an AP.
+type APSSIDOverride struct {
+	Index        int    `json:"index"`
+	GlobalSsid   string `json:"globalSsid,omitempty"`
+	SupportBands []int  `json:"supportBands,omitempty"`
+	SSIDEnable   bool   `json:"ssidEnable"`
+	Enable       bool   `json:"enable"`
+	SSID         string `json:"ssid,omitempty"`
+	PSK          string `json:"psk,omitempty"`
+	VlanEnable   bool   `json:"vlanEnable,omitempty"`
+	VlanID       int    `json:"vlanId,omitempty"`
+	Security     int    `json:"security,omitempty"`
+}
+
+// APLanPortSetting represents per-LAN-port config on an AP.
+type APLanPortSetting struct {
+	LanPort            interface{} `json:"lanPort"`
+	PortType           int         `json:"portType,omitempty"`
+	SupportVlan        bool        `json:"supportVlan,omitempty"`
+	LocalVlanEnable    bool        `json:"localVlanEnable,omitempty"`
+	SupportPoe         bool        `json:"supportPoe,omitempty"`
+	PoeOutEnable       bool        `json:"poeOutEnable,omitempty"`
+	Dot1xEnable        bool        `json:"dot1xEnable,omitempty"`
+	MabEnable          bool        `json:"mabEnable,omitempty"`
+	TaggedNetworkIDs   []string    `json:"taggedNetworkId,omitempty"`
+	UntaggedNetworkIDs []string    `json:"untaggedNetworkId,omitempty"`
+	Status             int         `json:"status,omitempty"`
+	Name               string      `json:"name,omitempty"`
+}
+
+// APConfig represents the full configurable AP object from GET /eaps/{mac}.
+// Fields that may be absent on certain AP models (e.g., EAP115 has no 5GHz,
+// no LLDP, no OFDMA) use pointer types so we can distinguish absent from zero.
+type APConfig struct {
+	Type            string          `json:"type,omitempty"`
+	MAC             string          `json:"mac,omitempty"`
+	Name            string          `json:"name"`
+	Model           string          `json:"model,omitempty"`
+	IP              string          `json:"ip,omitempty"`
+	Status          int             `json:"status,omitempty"`
+	FirmwareVersion string          `json:"firmwareVersion,omitempty"`
+	WlanID          string          `json:"wlanId,omitempty"`
+	RadioSetting2g  *APRadioSetting `json:"radioSetting2g,omitempty"`
+	RadioSetting5g  *APRadioSetting `json:"radioSetting5g,omitempty"`
+	IPSetting       *APIPSetting    `json:"ipSetting,omitempty"`
+	LEDSetting      int             `json:"ledSetting"`
+
+	// Pointer fields — absent on some AP models (nil = unsupported by hardware)
+	LLDPEnable           *int  `json:"lldpEnable,omitempty"`
+	OFDMAEnable2g        *bool `json:"ofdmaEnable2g,omitempty"`
+	OFDMAEnable5g        *bool `json:"ofdmaEnable5g,omitempty"`
+	LoopbackDetectEnable *bool `json:"loopbackDetectEnable,omitempty"`
+
+	MVlanEnable  bool            `json:"mvlanEnable"`
+	MVlanSetting *APMVlanSetting `json:"mvlanSetting,omitempty"`
+
+	L3AccessSetting *APL3AccessSetting `json:"l3AccessSetting,omitempty"`
+	LBSetting2g     *APLBSetting       `json:"lbSetting2g,omitempty"`
+	LBSetting5g     *APLBSetting       `json:"lbSetting5g,omitempty"`
+	RSSISetting2g   *APRSSISetting     `json:"rssiSetting2g,omitempty"`
+	RSSISetting5g   *APRSSISetting     `json:"rssiSetting5g,omitempty"`
+	QoSSetting2g    *APQoSSetting      `json:"qosSetting2g,omitempty"`
+	QoSSetting5g    *APQoSSetting      `json:"qosSetting5g,omitempty"`
+	AnyPoeEnable    bool               `json:"anyPoeEnable,omitempty"`
+	IPv6Enable      bool               `json:"ipv6Enable,omitempty"`
+
+	// Complex nested fields stored as raw JSON — parsed separately when needed
+	SSIDOverrides   json.RawMessage `json:"ssidOverrides,omitempty"`
+	LanPortSettings json.RawMessage `json:"lanPortSettings,omitempty"`
+}
+
+// ListDevices returns all devices in the current site.
+// The devices endpoint returns a plain JSON array (not paginated).
+func (c *Client) ListDevices(ctx context.Context) ([]Device, error) {
+	resp, err := c.doSiteRequest(ctx, http.MethodGet, "/devices", nil)
+	if err != nil {
+		return nil, err
+	}
+	var devices []Device
+	if err := json.Unmarshal(resp.Result, &devices); err != nil {
+		return nil, fmt.Errorf("decoding devices: %w", err)
+	}
+	return devices, nil
+}
+
+// GetAPConfig returns the full configuration for an AP by MAC address.
+func (c *Client) GetAPConfig(ctx context.Context, mac string) (*APConfig, error) {
+	resp, err := c.doSiteRequest(ctx, http.MethodGet, fmt.Sprintf("/eaps/%s", mac), nil)
+	if err != nil {
+		return nil, err
+	}
+	var config APConfig
+	if err := json.Unmarshal(resp.Result, &config); err != nil {
+		return nil, fmt.Errorf("decoding AP config: %w", err)
+	}
+	return &config, nil
+}
+
+// GetAPConfigRaw returns the raw JSON for an AP (needed for PATCH).
+func (c *Client) GetAPConfigRaw(ctx context.Context, mac string) (map[string]interface{}, error) {
+	resp, err := c.doSiteRequest(ctx, http.MethodGet, fmt.Sprintf("/eaps/%s", mac), nil)
+	if err != nil {
+		return nil, err
+	}
+	var raw map[string]interface{}
+	if err := json.Unmarshal(resp.Result, &raw); err != nil {
+		return nil, fmt.Errorf("decoding AP config raw: %w", err)
+	}
+	return raw, nil
+}
+
+// UpdateAPConfig updates an AP configuration via PATCH.
+// Similar to SSIDs, this likely requires the full object minus read-only fields.
+func (c *Client) UpdateAPConfig(ctx context.Context, mac string, config map[string]interface{}) (*APConfig, error) {
+	// Remove read-only / status fields that must not be in PATCH
+	readOnlyFields := []string{
+		"type", "mac", "model", "modelVersion", "ip", "status", "statusCategory",
+		"firmwareVersion", "version", "uptime", "uptimeLong", "cpuUtil", "memUtil",
+		"clientNum", "deviceMisc", "devCap", "wp2g", "wp5g",
+		"radioTraffic2g", "radioTraffic5g", "wiredUplink", "lanTraffic",
+		"lastSeen", "needUpgrade", "fwDownloadStatus", "adoptFailType",
+		"site", "compatible", "showModel", "snmpLocation",
+	}
+	for _, f := range readOnlyFields {
+		delete(config, f)
+	}
+
+	resp, err := c.doSiteRequest(ctx, http.MethodPatch, fmt.Sprintf("/eaps/%s", mac), config)
+	if err != nil {
+		return nil, err
+	}
+	var updated APConfig
+	if err := json.Unmarshal(resp.Result, &updated); err != nil {
+		return nil, fmt.Errorf("decoding updated AP config: %w", err)
+	}
+	return &updated, nil
+}
+
+// --- Switch Devices ---
+
+// SwitchIPSetting holds IP configuration for a switch.
+type SwitchIPSetting struct {
+	Mode         string `json:"mode"`
+	Fallback     bool   `json:"fallback,omitempty"`
+	FallbackIP   string `json:"fallbackIp,omitempty"`
+	FallbackMask string `json:"fallbackMask,omitempty"`
+}
+
+// SwitchSNMP holds SNMP settings for a switch.
+type SwitchSNMP struct {
+	Location string `json:"location"`
+	Contact  string `json:"contact"`
+}
+
+// SwitchPort represents a port configuration on a switch.
+type SwitchPort struct {
+	ID                    string   `json:"id,omitempty"`
+	Port                  int      `json:"port"`
+	Name                  string   `json:"name"`
+	Disable               bool     `json:"disable"`
+	Type                  int      `json:"type"`
+	MaxSpeed              int      `json:"maxSpeed,omitempty"`
+	NativeNetworkID       string   `json:"nativeNetworkId,omitempty"`
+	NetworkTagsSetting    int      `json:"networkTagsSetting"`
+	TagNetworkIDs         []string `json:"tagNetworkIds"`
+	UntagNetworkIDs       []string `json:"untagNetworkIds"`
+	VoiceNetworkEnable    bool     `json:"voiceNetworkEnable"`
+	VoiceDscpEnable       bool     `json:"voiceDscpEnable"`
+	ProfileID             string   `json:"profileId"`
+	ProfileName           string   `json:"profileName,omitempty"`
+	ProfileOverrideEnable bool     `json:"profileOverrideEnable"`
+	Operation             string   `json:"operation,omitempty"`
+	Speed                 int      `json:"speed"`
+}
+
+// SwitchConfig represents the full configurable switch object from GET /switches/{mac}.
+type SwitchConfig struct {
+	Type                 string           `json:"type,omitempty"`
+	MAC                  string           `json:"mac,omitempty"`
+	Name                 string           `json:"name"`
+	Model                string           `json:"model,omitempty"`
+	IP                   string           `json:"ip,omitempty"`
+	Status               int              `json:"status,omitempty"`
+	FirmwareVersion      string           `json:"firmwareVersion,omitempty"`
+	LEDSetting           int              `json:"ledSetting"`
+	MVlanNetworkID       string           `json:"mvlanNetworkId,omitempty"`
+	IPSetting            *SwitchIPSetting `json:"ipSetting,omitempty"`
+	LoopbackDetectEnable bool             `json:"loopbackDetectEnable"`
+	STP                  int              `json:"stp"`
+	Priority             int              `json:"priority"`
+	HelloTime            int              `json:"helloTime"`
+	MaxAge               int              `json:"maxAge"`
+	ForwardDelay         int              `json:"forwardDelay"`
+	TxHoldCount          int              `json:"txHoldCount"`
+	MaxHops              int              `json:"maxHops"`
+	SNMP                 *SwitchSNMP      `json:"snmp,omitempty"`
+	Jumbo                int              `json:"jumbo"`
+	LagHashAlg           int              `json:"lagHashAlg"`
+	Ports                []SwitchPort     `json:"ports,omitempty"`
+
+	// Complex fields stored as raw JSON
+	Lags json.RawMessage `json:"lags,omitempty"`
+}
+
+// GetSwitchConfig returns the full configuration for a switch by MAC address.
+func (c *Client) GetSwitchConfig(ctx context.Context, mac string) (*SwitchConfig, error) {
+	resp, err := c.doSiteRequest(ctx, http.MethodGet, fmt.Sprintf("/switches/%s", mac), nil)
+	if err != nil {
+		return nil, err
+	}
+	var config SwitchConfig
+	if err := json.Unmarshal(resp.Result, &config); err != nil {
+		return nil, fmt.Errorf("decoding switch config: %w", err)
+	}
+	return &config, nil
+}
+
+// GetSwitchConfigRaw returns the raw JSON for a switch (needed for PATCH).
+func (c *Client) GetSwitchConfigRaw(ctx context.Context, mac string) (map[string]interface{}, error) {
+	resp, err := c.doSiteRequest(ctx, http.MethodGet, fmt.Sprintf("/switches/%s", mac), nil)
+	if err != nil {
+		return nil, err
+	}
+	var raw map[string]interface{}
+	if err := json.Unmarshal(resp.Result, &raw); err != nil {
+		return nil, fmt.Errorf("decoding switch config raw: %w", err)
+	}
+	return raw, nil
+}
+
+// UpdateSwitchConfig updates a switch configuration via PATCH.
+func (c *Client) UpdateSwitchConfig(ctx context.Context, mac string, config map[string]interface{}) (*SwitchConfig, error) {
+	// Remove read-only / status fields that must not be in PATCH
+	readOnlyFields := []string{
+		"type", "mac", "model", "modelVersion", "compoundModel", "showModel",
+		"firmwareVersion", "version", "hwVersion", "ip", "publicIp",
+		"status", "statusCategory", "es", "site", "siteName", "omadacId",
+		"compatible", "category", "sn", "addedInAdvanced", "customId",
+		"remember", "rememberDevice", "boundSiteTemplate", "deviceSeriesType",
+		"resource", "ecspFirstVersion", "deviceMisc", "devCap",
+		"lastSeen", "needUpgrade", "uptime", "uptimeLong", "cpuUtil", "memUtil",
+		"poeTotalPower", "poeRemain", "poeRemainPercent", "fanStatus",
+		"download", "upload", "supportVlanIf", "speeds", "loop", "loopbackNum",
+		"sdm", "terminalPrefix", "supportHealth", "downlinkList",
+		"tagIds", "ipv6List",
+	}
+	for _, f := range readOnlyFields {
+		delete(config, f)
+	}
+
+	// Clean up port objects — remove read-only port fields
+	if ports, ok := config["ports"].([]interface{}); ok {
+		for _, p := range ports {
+			if port, ok := p.(map[string]interface{}); ok {
+				delete(port, "portStatus")
+				delete(port, "portCap")
+				delete(port, "portSpeedCap")
+				delete(port, "standardPort")
+				delete(port, "configStack")
+				delete(port, "fecSupport")
+				delete(port, "fecCap")
+				delete(port, "configMlagPeerLink")
+				delete(port, "configMlagDad")
+			}
+		}
+	}
+
+	resp, err := c.doSiteRequest(ctx, http.MethodPatch, fmt.Sprintf("/switches/%s", mac), config)
+	if err != nil {
+		return nil, err
+	}
+	var updated SwitchConfig
+	if err := json.Unmarshal(resp.Result, &updated); err != nil {
+		return nil, fmt.Errorf("decoding updated switch config: %w", err)
+	}
+	return &updated, nil
+}
